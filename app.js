@@ -45,8 +45,8 @@ const bcrypt = require('bcryptjs');
 
 // Configure passport with Google strategy
 passport.use(new GoogleStrategy({
-    clientID: '698055904284-ndiqi33f647kdagnraidl347k2ov5k3g.apps.googleusercontent.com',
-    clientSecret: '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',
+    clientID: '-',
+    clientSecret: '-',
     callbackURL: 'http://localhost:3000/auth/google/callback'
 },
 async (accessToken, refreshToken, profile, done) => {
@@ -176,8 +176,8 @@ app.post('/complete-profile', ensureAuthenticated, async (req, res) => {
 const db = mysql.createConnection({
     host: 'localhost',
     user: 'root',
-    password: '##sBi123',
-    database: 'clg_predictor'
+    password: '-',
+    database: '-'
 });
 
 db.connect((err) => {
