@@ -1,471 +1,297 @@
+require('dotenv').config();
 const express = require('express');
-const mysql = require('mysql2');
+const { Pool } = require('pg');
 const path = require('path');
-
+const session = require('express-session');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
 
 const app = express();
+const port = process.env.PORT || 3000;
+
+// Middleware
 app.use(express.static('public'));
-app.use(express.json()); // Ensure this middleware is used
-
-
-const port = 3000;
-
-// Set up EJS as the template engine
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-// Middleware to parse POST data
-app.use(express.urlencoded({ extended: true }));
-
-
-//start
-// Add these require statements at the top
-
-const session = require('express-session');
-const passport = require('passport');
-
-
-
-// 1. Session middleware FIRST
+// Session
 app.use(session({
-    secret: 'your-secret-key-here',
+    secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: false }
+    cookie: { secure: process.env.NODE_ENV === 'production' }
 }));
 
-// 2. THEN Passport middleware
+// Passport
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Rest of your app configuration...
+// PostgreSQL Connection
+const pool = new Pool({
+    connectionString: process.env.DB_CONNECTION_STRING,
+    ssl: { rejectUnauthorized: false }
+});
 
-const GoogleStrategy = require('passport-google-oauth20').Strategy;
-const bcrypt = require('bcryptjs');
+pool.connect()
+    .then(() => console.log('✅ Connected to PostgreSQL database'))
+    .catch(err => console.error('❌ Database connection error:', err));
 
-// Configure passport with Google strategy
+// Passport Configuration
 passport.use(new GoogleStrategy({
-    clientID: '-',
-    clientSecret: '-',
-    callbackURL: 'http://localhost:3000/auth/google/callback'
-},
-async (accessToken, refreshToken, profile, done) => {
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: process.env.NODE_ENV === 'production' 
+        ? 'https://your-render-app.onrender.com/auth/google/callback' 
+        : 'http://localhost:3000/auth/google/callback'
+}, async (accessToken, refreshToken, profile, done) => {
     try {
-        // Check if user exists in database
-        const [existingUser] = await db.promise().query('SELECT * FROM users WHERE google_id = ? OR email = ?', [profile.id, profile.emails[0].value]);
+        const { rows: existingUser } = await pool.query(
+            'SELECT * FROM users WHERE google_id = $1 OR email = $2',
+            [profile.id, profile.emails[0].value]
+        );
         
         if (existingUser.length > 0) {
-            // Update google_id if logging in with existing email
             if (!existingUser[0].google_id) {
-                await db.promise().query('UPDATE users SET google_id = ? WHERE email = ?', [profile.id, profile.emails[0].value]);
+                await pool.query(
+                    'UPDATE users SET google_id = $1 WHERE email = $2',
+                    [profile.id, profile.emails[0].value]
+                );
             }
             return done(null, existingUser[0]);
         } else {
-            // Create new user
-            const newUser = {
-                google_id: profile.id,
-                name: profile.displayName,
-                email: profile.emails[0].value,
-                mobile: null
-            };
-            
-            const [result] = await db.promise().query('INSERT INTO users SET ?', newUser);
-            newUser.id = result.insertId;
-            return done(null, newUser);
+            const { rows } = await pool.query(
+                'INSERT INTO users (google_id, name, email, mobile) VALUES ($1, $2, $3, $4) RETURNING *',
+                [profile.id, profile.displayName, profile.emails[0].value, null]
+            );
+            return done(null, rows[0]);
         }
     } catch (err) {
         return done(err, null);
     }
 }));
 
-// Serialize and deserialize user
-passport.serializeUser((user, done) => {
-    done(null, user.id);
-});
-
+// Serialization
+passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => {
     try {
-        const [user] = await db.promise().query('SELECT * FROM users WHERE id = ?', [id]);
-        done(null, user[0]);
+        const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+        done(null, rows[0]);
     } catch (err) {
         done(err, null);
     }
 });
 
-// Initialize passport and session
-app.use(passport.initialize());
-app.use(passport.session());
-
-// Add these routes for authentication
-app.get('/auth/google',
-    passport.authenticate('google', { scope: ['profile', 'email'] })
-);
-
-app.get('/auth/google/callback',
-    passport.authenticate('google', { failureRedirect: '/login' }),
-    (req, res) => {
-        // Successful authentication, redirect to complete profile if mobile is missing
-        if (!req.user.mobile) {
-            res.redirect('/complete-profile');
-        } else {
-            res.redirect('/');
-        }
-    }
-);
-
-// Add logout route
-app.get('/logout', (req, res) => {
-    req.logout(() => {
-        res.redirect('/login');
-    });
-});
-
-// Middleware to check authentication
+// Middleware
 function ensureAuthenticated(req, res, next) {
-    if (req.isAuthenticated()) {
-        return next();
-    }
-    res.redirect('/login');
+    req.isAuthenticated() ? next() : res.redirect('/login');
 }
 
-
-
-// Login route
-app.get('/login', (req, res) => {
-    if (req.isAuthenticated()) {
-        return res.redirect('/');
-    }
-    res.render('login');
+// Routes
+app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+app.get('/auth/google/callback', passport.authenticate('google', { failureRedirect: '/login' }), (req, res) => {
+    req.user.mobile ? res.redirect('/') : res.redirect('/complete-profile');
 });
-
-// Complete profile route
+app.get('/logout', (req, res) => req.logout(() => res.redirect('/login')));
+app.get('/login', (req, res) => req.isAuthenticated() ? res.redirect('/') : res.render('login'));
 app.get('/complete-profile', ensureAuthenticated, (req, res) => {
-    if (req.user.mobile) {
-        return res.redirect('/');
-    }
-    res.render('complete-profile', { user: req.user });
+    req.user.mobile ? res.redirect('/') : res.render('complete-profile', { user: req.user });
 });
-
-// Handle profile completion
 app.post('/complete-profile', ensureAuthenticated, async (req, res) => {
     try {
-        const { mobile } = req.body;
-        await db.promise().query('UPDATE users SET mobile = ? WHERE id = ?', [mobile, req.user.id]);
-        
-        // Update user in session
-        req.user.mobile = mobile;
+        await pool.query('UPDATE users SET mobile = $1 WHERE id = $2', [req.body.mobile, req.user.id]);
+        req.user.mobile = req.body.mobile;
         res.redirect('/');
     } catch (err) {
-        console.error('Error updating profile:', err);
+        console.error('Profile update error:', err);
         res.redirect('/complete-profile');
     }
 });
-// Update your existing routes to use ensureAuthenticated middleware
-// app.get('/', ensureAuthenticated, (req, res) => {
-//     // Your existing route logic
-// });
 
-// app.post('/search', ensureAuthenticated, (req, res) => {
-//     // Your existing route logic
-// });
-//end
-
-
-
-// MySQL connection setup
-const db = mysql.createConnection({
-    host: 'localhost',
-    user: 'root',
-    password: '-',
-    database: '-'
-});
-
-db.connect((err) => {
-    if (err) {
-        console.error('Error connecting to the database:', err);
-        return;
-    }
-    console.log('Connected to the MySQL database.');
-});
-
-
+// Helper Function (Unchanged)
 function generateCategories(selectedCaste, selectedClass, selectedGender) {
     const categories = [];
-
     const specialCastes = ['EWS', 'JKM', 'JKR', 'NTPC'];
+    
     if (specialCastes.includes(selectedCaste)) {
-        categories.push(selectedCaste);  // No class or gender considered
-        categories.push('UR/X/OP');
-        return categories;  // Exit early since no more categories are needed
+        categories.push(selectedCaste, 'UR/X/OP');
+        return categories;
     }
-
-    // Special case for FW: add 'FW/OP' only
+    
     if (selectedCaste === 'FW') {
-        categories.push('FW/OP');
-        categories.push('UR/X/OP');
-        return categories;  // Exit early since no other categories are needed
+        categories.push('FW/OP', 'UR/X/OP');
+        return categories;
     }
-
     
     const castes = selectedCaste !== 'UR' ? [selectedCaste, 'UR'] : ['UR'];
     const classes = selectedClass !== 'X' ? [selectedClass, 'X'] : ['X'];
     const genders = selectedGender !== 'OP' ? [selectedGender, 'OP'] : ['OP'];
-
-    // Generate combinations of caste, class, and gender
-    castes.forEach(caste => {
-        classes.forEach(classType => {
-            genders.forEach(gender => {
-                const category = `${caste}/${classType}/${gender}`;
-                categories.push(category);
-            });
-        });
-    });
-
+    
+    castes.forEach(caste => classes.forEach(classType => genders.forEach(gender => {
+        categories.push(`${caste}/${classType}/${gender}`);
+    })));
+    
     return categories;
 }
 
+// Main Route (Fixed for template compatibility)
+app.get('/', ensureAuthenticated, async (req, res) => {
+    try {
+        const [
+            instituteTypes,
+            cities,
+            collegeNames,
+            years,
+            branches
+        ] = await Promise.all([
+            pool.query('SELECT DISTINCT institute_type FROM data_table'),
+            pool.query('SELECT DISTINCT city FROM data_table WHERE year = 2024'),
+            pool.query('SELECT DISTINCT college_name FROM data_table WHERE year = 2024 ORDER BY college_name ASC'),
+            pool.query('SELECT DISTINCT year FROM data_table'),
+            pool.query('SELECT DISTINCT branch FROM data_table WHERE year = 2024')
+        ]);
 
-app.get('/',ensureAuthenticated, (req, res) => {
-    const instituteTypeQuery = 'SELECT DISTINCT institute_type FROM data_table';
-    const cityQuery = 'SELECT DISTINCT city FROM data_table  WHERE year = 2024';
-    const collegeNameQuery = 'SELECT DISTINCT college_name FROM data_table  WHERE year = 2024 ORDER BY college_name ASC';
-    const yearQuery = 'SELECT DISTINCT year FROM data_table';
-    const query = `SELECT DISTINCT branch FROM data_table  WHERE year = 2024`;
-
-
-        db.query(instituteTypeQuery, (err, instituteTypes) => {
-             if (err) {
-                console.error('Error fetching institute types:', err);
-                return res.status(500).send('Internal Server Error');
-            }
-
-        db.query(cityQuery, (err, cities) => {
-            if (err) {
-                console.error('Error fetching cities:', err);
-                return res.status(500).send('Internal Server Error');
-            }
-
-        const sortedCities = cities.map(row => row.city).sort();
-
-        db.query(collegeNameQuery, (err, collegeNames) => {
-            if (err) {
-                console.error('Error fetching college names:', err);
-                return res.status(500).send('Internal Server Error');
-            }
-
-        db.query(yearQuery, (err, years) => {
-            if (err) {
-                console.error('Error fetching years:', err);
-                return res.status(500).send('Internal Server Error');
-            }
-  
-        db.query(query, (err, branchResults) => {
-            if (err) {
-                console.error('Error fetching branches:', err);
-                return res.status(500).send('Internal Server Error');
-            }
-
-    
-                        res.render('index', {
-                            collegeNames: collegeNames.map(row => row.college_name),
-                            instituteTypes: instituteTypes.map(row => row.institute_type),
-                            cities: sortedCities,
-                            years: years.map(row => row.year),
-                        
-                            castes: ['EWS', 'FW', 'OBC', 'SC', 'ST', 'UR'], // Caste options
-                            classes: ['X', 'H', 'S', 'NCC', 'FF'], // Class options
-                            genders: ['OP', 'F'], // Gender options
-                            branches: branchResults,
-                            //start 
-                            user: req.user || null //end
-                        });
-                    });
-                });
-            });
+        // KEY FIX: Maintain object structure for branches
+        res.render('index', {
+            collegeNames: collegeNames.rows.map(row => row.college_name),
+            instituteTypes: instituteTypes.rows.map(row => row.institute_type),
+            cities: cities.rows.map(row => row.city).sort(),
+            years: years.rows.map(row => row.year),
+            castes: ['EWS', 'FW', 'OBC', 'SC', 'ST', 'UR'],
+            classes: ['X', 'H', 'S', 'NCC', 'FF'],
+            genders: ['OP', 'F'],
+            branches: branches.rows, // Pass as array of objects
+            user: req.user || null
         });
-    });
-});
-
-
-
-app.post('/update-cities', (req, res) => {
-    const { institute_types } = req.body;
-
-    if (!institute_types || institute_types.length === 0) {
-        return res.json({ cities: [] });
+    } catch (err) {
+        console.error('Main page error:', err);
+        res.status(500).send('Internal Server Error');
     }
-
-    const placeholders = institute_types.map(() => '?').join(',');
-    const query = `SELECT DISTINCT city FROM data_table WHERE institute_type IN (${placeholders}) AND year = 2024`;
-
-    db.query(query, institute_types, (err, results) => {
-        if (err) {
-            console.error('Error fetching cities:', err);
-            return res.status(500).send('Internal Server Error');
-        }
-
-        const sortedCities = results.map(row => row.city).sort();
-
-        res.json({ cities: sortedCities });
-    });
 });
 
-
-app.post('/update-colleges', (req, res) => {
-    const { institute_types, cities } = req.body;
-
-    if (!institute_types || !cities || institute_types.length === 0 || cities.length === 0) {
-        return res.json({ colleges: [] });
+// AJAX Routes (Maintain object structure for consistency)
+app.post('/update-cities', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT DISTINCT city FROM data_table WHERE institute_type = ANY($1) AND year = 2024',
+            [req.body.institute_types || []]
+        );
+        res.json({ cities: rows.map(row => row.city).sort() });
+    } catch (err) {
+        console.error('Cities update error:', err);
+        res.status(500).json({ error: 'Internal Server Error' });
     }
-
-    const institutePlaceholders = institute_types.map(() => '?').join(',');
-    const cityPlaceholders = cities.map(() => '?').join(',');
-    const query = `
-        SELECT DISTINCT college_name 
-        FROM data_table 
-        WHERE institute_type IN (${institutePlaceholders}) 
-        AND city IN (${cityPlaceholders})
-        AND year = 2024
-        ORDER BY college_name ASC
-    `;
-
-    db.query(query, [...institute_types, ...cities], (err, results) => {
-        if (err) {
-            console.error('Error fetching colleges:', err);
-            return res.status(500).send('Internal Server Error');
-        }
-
-        res.json({ colleges: results.map(row => row.college_name) });
-    });
 });
 
-
-
-app.post('/update-branches', (req, res) => {
-    const { colleges } = req.body;
-
-    if (!colleges || colleges.length === 0) {
-        return res.json({ branches: [] });
+app.post('/update-colleges', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT DISTINCT college_name FROM data_table 
+             WHERE institute_type = ANY($1) 
+             AND city = ANY($2)
+             AND year = 2024
+             ORDER BY college_name ASC`,
+            [req.body.institute_types || [], req.body.cities || []]
+        );
+        res.json({ colleges: rows.map(row => row.college_name) });
+    } catch (err) {
+        console.error('Colleges update error:', err);
+        res.status(500).json({ error: 'Internal Server Error' });
     }
-
-    const placeholders = colleges.map(() => '?').join(',');
-    const query = `SELECT DISTINCT branch FROM data_table WHERE college_name IN (${placeholders}) AND year = 2024`;
-
-    db.query(query, colleges, (err, results) => {
-        if (err) {
-            console.error('Error fetching branches:', err);
-            return res.status(500).send('Internal Server Error');
-        }
-
-        const sortedBranches = results.map(row => row.branch).sort();
-
-        res.json({ branches: sortedBranches});
-    });
 });
 
-
+app.post('/update-branches', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            'SELECT DISTINCT branch FROM data_table WHERE college_name = ANY($1) AND year = 2024',
+            [req.body.colleges || []]
+        );
+        // Return objects to match main route format
+        res.json({ branches: rows });
+    } catch (err) {
+        console.error('Branches update error:', err);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
 
 app.get('/generate-categories', (req, res) => {
-    const selectedCaste = req.query.caste;
-    const selectedClass = req.query.class;
-    const selectedGender = req.query.gender;
-
-    // Call the generateCategories function
-    const categories = generateCategories(selectedCaste, selectedClass, selectedGender);
-
-    // Send the categories back as JSON
-    res.json({ categories });
+    res.json({ categories: generateCategories(req.query.caste, req.query.class, req.query.gender) });
 });
 
+// Search Route (Unchanged from your original logic)
+app.post('/search', ensureAuthenticated, async (req, res) => {
+    try {
+        const rank = parseInt(req.body.rank);
+        const selectedCaste = req.body.caste;
+        const selectedClass = req.body.class;
+        const selectedGender = req.body.gender;
+        const selectedCollegeNames = req.body.college_name || [];
+        const instituteTypes = req.body.institute_type || [];
+        const selectedCities = req.body.city || [];
+        const selectedRound = req.body.round;
+        const rankRange = parseInt(req.body.rank_range);
+        const domicile = req.body.domicile;
+        const sortBy = req.body.sort_by || 'closing_rank';
+        const selectedBranches = req.body.branch || [];
 
+        const lowerBound = rank - rankRange;
+        const upperBound = rank + rankRange;
 
-app.post('/search',ensureAuthenticated, (req, res) => {
+        // Generate categories
+        const selectedCategories = req.body.selectedCategories || [];
+        const categories = selectedCategories.length > 0 ? 
+            selectedCategories : 
+            generateCategories(selectedCaste, selectedClass, selectedGender);
 
+        // Create condition for selected categories
+        const categoryCondition = categories.length > 0 ? 
+            `allotted_category = ANY($8)` : 
+            'TRUE';
 
+        // Handle round values
+        const roundValues = selectedRound === 'FIRST&UPGRADE' ? 
+            ['FIRST', 'UPGRADE'] : 
+            [selectedRound];
 
-    const rank = parseInt(req.body.rank);
-    const selectedCaste = req.body.caste;
-    const selectedClass = req.body.class;
-    const selectedGender = req.body.gender;
-    const selectedCollegeNames = req.body.college_name || [];
-    const instituteTypes = req.body.institute_type || [];
-    const selectedCities = req.body.city || [];
-    //const selectedYear = req.body.year;
-    const selectedRound = req.body.round;
-    const rankRange = parseInt(req.body.rank_range);
-    const domicile = req.body.domicile;
-    const sortBy = req.body.sort_by || 'closing_rank';
-    const selectedBranches = req.body.branch || [];
-
-    const lowerBound = rank - rankRange;
-    const upperBound = rank + rankRange;
-
-    // Prepare queries using arrays and joins
-    const branchQuery = selectedBranches.length > 0 ? 
-        selectedBranches.map(branch => `'${branch}'`).join(',') : 
-        "SELECT DISTINCT branch FROM data_table WHERE year = 2024";
-
-    const instituteTypeQuery = Array.isArray(instituteTypes) ? 
-        instituteTypes.map(type => `'${type}'`).join(',') : 
-        `'${instituteTypes}'`;
-
-    const cityQuery = Array.isArray(selectedCities) ? 
-        selectedCities.map(city => `'${city}'`).join(',') : 
-        `'${selectedCities}'`;
-
-    let domicileCondition = '';
-    if (domicile === 'AI') {
-        domicileCondition = 'AND (domicile = "AI" OR domicile = "PR" OR domicile = "NO")';
-    } else if (domicile === 'Y') {
-        domicileCondition = 'AND (domicile = "YE" OR domicile = "PR")';
-    }
-
-    const selectedCategories = req.body.selectedCategories || [];
-    const categories = Array.isArray(selectedCategories) ? selectedCategories : [selectedCategories];
-
-    // Generate default categories if none are selected
-    if (categories.length === 0) {
-        categories.push(...generateCategories(selectedCaste, selectedClass, selectedGender));
-    }
-
-    // Create a condition for the selected categories
-    const categoryCondition = categories.length > 0 ? 
-        categories.map(cat => `allotted_category = '${cat}'`).join(' OR ') : 
-        '';
-
-    // Handle multiple college names
-    const collegeNameQuery = selectedCollegeNames.length > 0 ? 
-        `college_name IN (${selectedCollegeNames.map(name => `'${name}'`).join(',')})` : 
-        '1=1'; 
-
-    // Handle round values
-    const roundQuery = selectedRound === 'FIRST&UPGRADE' ? 
-        `'FIRST', 'UPGRADE'` : 
-        `'${selectedRound}'`;
-
-    // Combined query for performance
-    const query = `
-        SELECT college_name, institute_type, branch, allotted_category, opening_rank, closing_rank, city, year, round
-        FROM data_table
-        WHERE closing_rank BETWEEN ? AND ?
-        AND (${categoryCondition})
-        AND (${collegeNameQuery})
-        AND institute_type IN (${instituteTypeQuery})
-        AND branch IN (${branchQuery})  
-        AND city IN (${cityQuery})
-        AND year = 2024
-        AND round IN (${roundQuery})
-        ${domicileCondition}
-    `;
-
-    // Execute the main query
-    db.query(query, [lowerBound, upperBound], (err, results) => {
-        if (err) {
-            console.error('Error executing query:', err);
-            return res.status(500).send('Internal Server Error');
+        // Domicile condition
+        let domicileCondition = '';
+        if (domicile === 'AI') {
+            domicileCondition = 'AND (domicile = \'AI\' OR domicile = \'PR\' OR domicile = \'NO\')';
+        } else if (domicile === 'Y') {
+            domicileCondition = 'AND (domicile = \'YE\' OR domicile = \'PR\')';
         }
 
-        // Store unique results based on college-branch combination
+        // Main query
+        const query = `
+            SELECT college_name, institute_type, branch, allotted_category, 
+                   opening_rank, closing_rank, city, year, round
+            FROM data_table
+            WHERE closing_rank BETWEEN $1 AND $2
+            AND (${categoryCondition})
+            AND college_name = ANY($3)
+            AND institute_type = ANY($4)
+            AND branch = ANY($5)
+            AND city = ANY($6)
+            AND year = 2024
+            AND round = ANY($7)
+            ${domicileCondition}
+        `;
+
+        const values = [
+            lowerBound,
+            upperBound,
+            selectedCollegeNames,
+            instituteTypes,
+            selectedBranches,
+            selectedCities,
+            roundValues,
+            categories
+        ];
+
+        const { rows: results } = await pool.query(query, values);
+        
+        // Process results (same as your original code)
         const uniqueResults = {};
         results.forEach(row => {
             const key = `${row.college_name}-${row.branch}`;
@@ -476,89 +302,73 @@ app.post('/search',ensureAuthenticated, (req, res) => {
 
         const finalResults = Object.values(uniqueResults);
 
-        // Fetch all historical data in a single query for the relevant years
+        // Historical data processing
         const historicalQuery = `
             SELECT college_name, branch, allotted_category, round, year, opening_rank, closing_rank
             FROM data_table
             WHERE year IN (2022, 2023, 2024)
-            AND round IN (${roundQuery})
+            AND round = ANY($1)
         `;
+        const historicalResult = await pool.query(historicalQuery, [roundValues]);
+        const historicalData = {};
+        historicalResult.rows.forEach(rank => {
+            const key = `${rank.college_name}-${rank.branch}-${rank.allotted_category}-${rank.round}-${rank.year}`;
+            historicalData[key] = rank;
+        });
 
-        db.query(historicalQuery, (err, historicalRanks) => {
-            if (err) {
-                console.error('Error fetching historical ranks:', err);
-                return res.status(500).send('Internal Server Error');
-            }
-
-            // Organize historical ranks by key
-            const historicalData = {};
-            historicalRanks.forEach(rank => {
-                const key = `${rank.college_name}-${rank.branch}-${rank.allotted_category}-${rank.round}-${rank.year}`;
-                historicalData[key] = rank;
-            });
-
-            // Merge historical data with final results
-            finalResults.forEach(result => {
-                const key2022 = `${result.college_name}-${result.branch}-${result.allotted_category}-${result.round}-2022`;
-                const key2023 = `${result.college_name}-${result.branch}-${result.allotted_category}-${result.round}-2023`;
-                const key2024 = `${result.college_name}-${result.branch}-${result.allotted_category}-${result.round}-2024`;
-
-                result.opening_rank_2024 = historicalData[key2024]?.opening_rank || 'N/A';
-                result.closing_rank_2024 = historicalData[key2024]?.closing_rank || 'N/A';
-                result.opening_rank_2023 = historicalData[key2023]?.opening_rank || 'N/A';
-                result.closing_rank_2023 = historicalData[key2023]?.closing_rank || 'N/A';
-                result.opening_rank_2022 = historicalData[key2022]?.opening_rank || 'N/A';
-                result.closing_rank_2022 = historicalData[key2022]?.closing_rank || 'N/A';
-            });
-
-            // Fetch trend ranks for sorting criteria
-            db.query(`SELECT college_name, branch, rank_number FROM ranked_list`, (err, trendRanks) => {
-                if (err) {
-                    console.error('Error fetching trend ranks:', err);
-                    return res.status(500).send('Internal Server Error');
+        // Merge historical data
+        finalResults.forEach(result => {
+            const keys = [2022, 2023, 2024].map(year => 
+                `${result.college_name}-${result.branch}-${result.allotted_category}-${result.round}-${year}`
+            );
+            
+            keys.forEach((key, i) => {
+                const year = 2022 + i;
+                if (historicalData[key]) {
+                    result[`opening_rank_${year}`] = historicalData[key].opening_rank;
+                    result[`closing_rank_${year}`] = historicalData[key].closing_rank;
+                } else {
+                    result[`opening_rank_${year}`] = 'N/A';
+                    result[`closing_rank_${year}`] = 'N/A';
                 }
-
-                // Map trend ranks for efficient access
-                const rankMap = new Map(trendRanks.map(rank => [`${rank.college_name}-${rank.branch}`, rank.rank_number]));
-
-                // Helper function to extract 2024 rank from a formatted string
-            // Helper function to extract 2024 rank from a formatted string
-
-
-
-                // Sorting based on the selected criteria
-                finalResults.sort((a, b) => {
-                    let comparisonResult = 0;
-
-                    if (sortBy === 'lastYearTrend') {
-                        const keyA = `${a.college_name}-${a.branch}`;
-                        const keyB = `${b.college_name}-${b.branch}`;
-                        const rankA = rankMap.get(keyA) || Number.MAX_SAFE_INTEGER;
-                        const rankB = rankMap.get(keyB) || Number.MAX_SAFE_INTEGER;
-                        comparisonResult = rankA - rankB; // Lower rank is higher priority
-                    } else if (sortBy === 'closing_rank') {
-                        const a2024ClosingRank = a.closing_rank_2024;
-                        const b2024ClosingRank = b.closing_rank_2024;
-                        comparisonResult = a2024ClosingRank - b2024ClosingRank;
-                    } else if (sortBy === 'opening_rank') {
-                        const a2024OpeningRank = a.opening_rank_2024;
-                        const b2024OpeningRank = b.opening_rank_2024;
-                        comparisonResult = a2024OpeningRank - b2024OpeningRank;
-                    }
-
-                    return comparisonResult;
-                });
-
-                console.log('Filtered and Sorted Results:', finalResults); // Print the final results for debugging
-                res.render('results', { results: finalResults });
             });
         });
-    });
+
+        // Trend ranks
+        const trendResult = await pool.query('SELECT college_name, branch, rank_number FROM ranked_list');
+        const rankMap = new Map();
+        trendResult.rows.forEach(row => {
+            rankMap.set(`${row.college_name}-${row.branch}`, row.rank_number);
+        });
+
+        // Sorting
+        finalResults.sort((a, b) => {
+            if (sortBy === 'lastYearTrend') {
+                const keyA = `${a.college_name}-${a.branch}`;
+                const keyB = `${b.college_name}-${b.branch}`;
+                const rankA = rankMap.get(keyA) || Number.MAX_SAFE_INTEGER;
+                const rankB = rankMap.get(keyB) || Number.MAX_SAFE_INTEGER;
+                return rankA - rankB;
+            } else if (sortBy === 'closing_rank') {
+                return a.closing_rank_2024 - b.closing_rank_2024;
+            } else if (sortBy === 'opening_rank') {
+                return a.opening_rank_2024 - b.opening_rank_2024;
+            }
+            return 0;
+        });
+
+        res.render('results', { results: finalResults });
+    } catch (err) {
+        console.error('Search error:', err);
+        res.status(500).send('Internal Server Error');
+    }
 });
 
-
+// Start server
 app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}/`);
+    console.log(`\n✅ ==============================================`);
+    console.log(`✅  Server running at http://localhost:${port}/`);
+    console.log(`✅ ==============================================`);
+    console.log(`\n🌐 Open in browser: http://localhost:${port}/`);
+    console.log(`🚨 Press Ctrl+C to stop the server\n`);
 });
-
-
